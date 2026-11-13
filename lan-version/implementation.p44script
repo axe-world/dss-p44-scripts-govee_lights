@@ -1,0 +1,135 @@
+// Govee LAN Farblicht - H6076 / H60B0 
+// Voraussetzungen: Govee Home App -> LAN-Steuerung aktiviert.
+// KEIN Cloud-API-Key erforderlich.
+//
+// DIESE VARIABLE PRO GERÄT ANPASSEN:
+var lamp_ip = '192.168.1.1' // IP dieser Lampe
+//
+// Beide Modelle verwenden die gleichen Standard-LAN-Befehle.
+// RGB: colorwc; Ein/Aus: turn; Helligkeit: brightness.
+// model dient nur zur Kennzeichnung im Log.
+// Kein Ist-Status-Polling: UDP send() bestätigt keinen Empfang.
+
+var udp = udpsocket(lamp_ip, 4003)
+var io_lock = lock()
+var wanted_brightness = 100
+var wanted_r = 100
+var wanted_g = 100
+var wanted_b = 100
+var have_color = false
+var color_pending = false
+var last_power = -1
+var last_brightness = -1
+var last_rgb = -1
+
+local function sendstandard(command, data) {
+  var payload = string({'msg':{'cmd':command,'data':data}})
+  var n = udp.send(payload)
+  if (!isok(n) || n != strlen(payload)) {
+    log(3, 'Govee %s UDP-Fehler %s: %s/%s Bytes', model, command, n, strlen(payload))
+    return false
+  }
+  log(5, 'Govee %s %s: %s', model, command, payload)
+  return true
+}
+
+// digitalSTROM: RGB primaries 0..100, getrennte Helligkeitssteuerung.
+// RGB-Werte auf volle Farbintensität normalisieren, damit Helligkeit
+// nicht zweimal (RGB und brightness) eingerechnet wird.
+local function applylight() {
+  if (!io_lock.enter(0:05)) {
+    log(3, 'Govee %s: UDP-Lock Timeout', model)
+    return
+  }
+  try {
+    var bright = round(limited(wanted_brightness,0,100))
+    var power = number(bright > 0)
+    var ok = true
+
+    if (power == 0) {
+      if (last_power != 0) {
+        if (sendstandard('turn', {'value':0})) last_power = 0
+      }
+    }
+    else {
+      if (last_power != 1) {
+        // Beim Einschalten ausschliesslich 'turn' senden.
+        // Vorherige Farbe und Helligkeit bleiben in der Govee-Lampe erhalten.
+        // Eventuell mit dem Einschaltvorgang gemeldete 'primaries'
+        // duerfen keine neue (z.B. warmweisse) Farbe ausloesen.
+        ok = sendstandard('turn', {'value':1})
+        if (ok) {
+          last_power = 1
+          color_pending = false
+          // Merken, welcher logische Helligkeitswert beim Einschalten
+          // vorlag, um bei einem direkt folgenden 'apply' keinen
+          // ungewollten brightness-Befehl nachzureichen.
+          last_brightness = bright
+          log(5,'Govee %s: Nur eingeschaltet, Farbe/Helligkeit beibehalten',model)
+        }
+      }
+      else {
+
+      if (ok && last_brightness != bright) {
+        ok = sendstandard('brightness', {'value':bright})
+        if (ok) {
+          last_brightness = bright
+          delay(0.2)
+        }
+      }
+
+      if (ok && have_color && color_pending) {
+        var mx = max(wanted_r,wanted_g,wanted_b)
+        if (mx > 0) {
+          var r = round(limited(wanted_r / mx * 255,0,255))
+          var g = round(limited(wanted_g / mx * 255,0,255))
+          var b = round(limited(wanted_b / mx * 255,0,255))
+          var rgb = r * 65536 + g * 256 + b
+
+          if (rgb != last_rgb) {
+            ok = sendstandard('colorwc', {
+              'color':{'r':r,'g':g,'b':b},
+              'colorTemInKelvin':0
+            })
+            if (ok) last_rgb = rgb
+          }
+          if (ok) color_pending = false
+        }
+        else {
+          log(5, 'Govee %s: RGB=0, Farbe beibehalten; Aus via brightness=0',model)
+          color_pending = false
+        }
+      }
+      }
+    }
+  }
+  catch as e {
+    log(3,'Govee %s Fehler beim Anwenden: %s',model,e)
+  }
+  io_lock.leave()
+}
+
+on (message()) as m {
+  log(6,'Govee %s Nachricht: %s',model,m)
+  if (m.message == 'channel' && m.index == 0) {
+    wanted_brightness = limited(m.value,0,100)
+  }
+  else if (m.message == 'primaries') {
+    wanted_r = limited(m.r,0,100)
+    wanted_g = limited(m.g,0,100)
+    wanted_b = limited(m.b,0,100)
+    have_color = true
+    color_pending = true
+    log(5,'Govee %s RGB empfangen: %s,%s,%s',model,wanted_r,wanted_g,wanted_b)
+  }
+  else if (m.message == 'apply') {
+    applylight()
+  }
+  else if (m.message == 'sync') {
+    // Kein Ist-Wert-Ruecklesen implementiert. Init: sync=false.
+    message({'message':'synced'})
+  }
+}
+
+log(5,'Govee LAN Farblicht gestartet: %s / %s',model,lamp_ip)
+return true

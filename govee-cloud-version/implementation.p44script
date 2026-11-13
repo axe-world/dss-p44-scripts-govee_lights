@@ -1,0 +1,331 @@
+// Govee OpenAPI 
+// Init: protocol=json, output=colorlight, colormode=RGB, sync=true
+//
+// Reines Einschalten: NUR powerSwitch=1, weder Farbe noch Helligkeit.
+// Externe Aenderungen: alle 60 s pollen, Werte nur bei Aenderungen melden.
+
+// =====================================================
+// Konfiguration (pro Lampe eine eigene Script-Instanz)
+// =====================================================
+var model = 'H60B0'     //MUSS ANGEPASST WERDEN JE NACH GOVEE MODELL!
+var govee_device = 'ANPASSEN'   //MUSS ANGEPASST WERDEN FÜR DAS EIGENE GOVEE DEVICE!!
+var govee_sku = model
+var govee_key = 'ANPASSEN'  //MUSS ANGEPASST WERDEN AUF DEN EIGENEN GOVEE CLOUD API KEY!!
+
+var base_url = 'https://openapi.api.govee.com/router/api/v1'
+var control_url = base_url + '/device/control'
+var state_url = base_url + '/device/state'
+
+// =====================================================
+// Zustand
+// =====================================================
+var actual_power
+var actual_brightness
+var actual_rgb
+
+var desired_brightness
+var desired_rgb
+var brightness_pending = false
+var rgb_pending = false
+
+var reported_brightness
+var reported_rgb
+var reported_color_brightness
+var api_lock = lock()
+
+// apply kann vor dem letzten primaries eintreffen.
+// Jeden Burst kurz sammeln und nur den neuesten Stand anwenden.
+var apply_revision = 0
+var apply_waiting = false
+
+// Schuetzt vor veralteten Cloud-Ist-Werten direkt nach Steuern.
+var last_control_time = 0
+
+// =====================================================
+// API (mit HTTP-Status, Govee-Code und Fehlerbehandlung)
+// =====================================================
+local function govee_request(url, payload)
+{
+  var req = {
+    'url': url,
+    'method': 'POST',
+    'timeout': 10,
+    'withmeta': true,
+    'headers': {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+      'Govee-API-Key': govee_key
+    }
+  }
+
+  try {
+    var response = httprequest(req, payload)
+    if (response.status != 200) {
+      log(4, 'Govee %s HTTP-Fehler %s: %s', model, response.status, response.data)
+      return null
+    }
+
+    var data = json(response.data)
+    if (!isok(data) || data.code != 200) {
+      log(4, 'Govee %s API-Fehler: %s', model, response.data)
+      return null
+    }
+    return data
+  }
+  catch as e {
+    log(4, 'Govee %s Request-Exception: %s', model, e)
+    return null
+  }
+}
+
+// Nur aus einem Abschnitt mit gehaltenem api_lock aufrufen.
+local function govee_control(type, instance, value)
+{
+  var payload = {
+    'requestId': string(random(1, 1000000000, 1)),
+    'payload': {
+      'sku': govee_sku,
+      'device': govee_device,
+      'capability': {
+        'type': type,
+        'instance': instance,
+        'value': value
+      }
+    }
+  }
+
+  var result = govee_request(control_url, payload)
+  if (!isok(result)) return false
+
+  last_control_time = epochtime()
+  log(6, 'Govee %s: %s = %s', model, instance, value)
+  return true
+}
+
+// =====================================================
+// P44 0..100 RGB nach Govee 24-bit RGB, ohne Doppeldimmung
+// =====================================================
+local function calculate_rgb(r, g, b)
+{
+  var maximum = max(r, g, b)
+  if (maximum <= 0) return null
+  var red = round(limited(r / maximum * 255, 0, 255))
+  var green = round(limited(g / maximum * 255, 0, 255))
+  var blue = round(limited(b / maximum * 255, 0, 255))
+  return red * 65536 + green * 256 + blue
+}
+
+// =====================================================
+// Status lesen und nur geaenderte Werte an P44 melden
+// =====================================================
+local function govee_poll()
+{
+  if (!api_lock.enter(0:15)) {
+    log(4, 'Govee %s Poll: Lock-Timeout', model)
+    return false
+  }
+
+  var payload = {
+    'requestId': string(random(1, 1000000000, 1)),
+    'payload': { 'sku': govee_sku, 'device': govee_device }
+  }
+  var result = govee_request(state_url, payload)
+  var success = false
+
+  if (isok(result) && isok(result.payload.capabilities)) {
+    var online = true
+    var power
+    var brightness
+    var rgb
+
+    foreach result.payload.capabilities as cap {
+      if (isok(cap.state.value)) {
+        if (cap.instance == 'online') online = boolean(cap.state.value)
+        if (cap.instance == 'powerSwitch') power = number(cap.state.value)
+        if (cap.instance == 'brightness') brightness = number(cap.state.value)
+        if (cap.instance == 'colorRgb') rgb = number(cap.state.value)
+      }
+    }
+
+    if (online) {
+      // Govee kann unmittelbar nach einem Control-Request noch den
+      // vorherigen Status liefern. Keine veralteten Werte zurueckmelden.
+      if (epochtime() - last_control_time < 3) {
+        log(7, 'Govee %s: Poll direkt nach Steuerung uebersprungen', model)
+        api_lock.leave()
+        return true
+      }
+      if (isok(power)) actual_power = power
+      if (isok(brightness)) actual_brightness = brightness
+      if (isok(rgb)) actual_rgb = rgb
+
+      // Keine historischen Offlinewerte melden.
+      if (isok(actual_power)) {
+        var ds_brightness
+        if (actual_power == 0) {
+          ds_brightness = 0
+        }
+        else if (isok(actual_brightness)) {
+          ds_brightness = actual_brightness
+        }
+
+        if (isok(ds_brightness) && reported_brightness != ds_brightness) {
+          message({ 'message': 'channel', 'id': 'brightness', 'value': ds_brightness })
+          reported_brightness = ds_brightness
+        }
+
+        // RGB ist im P44-Primaries-Format bereits mit Helligkeit skaliert.
+        // Bei AUS keine Farbmeldung, um gespeicherte Farbe zu erhalten.
+        if (actual_power == 1 && isok(actual_rgb) && isok(actual_brightness)) {
+          if (reported_rgb != actual_rgb || reported_color_brightness != actual_brightness) {
+            // Hinweis: Um Farb/Helligkeitsaenderungen gemeinsam zu erkennen,
+            // wird der Vergleich auf den zuletzt gemeldeten Farbfaktor separat gemacht.
+            var red = bit(16, 23, actual_rgb)
+            var green = bit(8, 15, actual_rgb)
+            var blue = bit(0, 7, actual_rgb)
+            var factor = actual_brightness / 100
+            message({
+              'message': 'primaries',
+              'r': red / 255 * 100 * factor,
+              'g': green / 255 * 100 * factor,
+              'b': blue / 255 * 100 * factor
+            })
+            reported_rgb = actual_rgb
+            reported_color_brightness = actual_brightness
+          }
+        }
+      }
+      success = true
+    }
+    else {
+      log(5, 'Govee %s ist laut Cloud offline; Werte ignoriert', model)
+    }
+  }
+
+  api_lock.leave()
+  return success
+}
+
+// =====================================================
+// DigitalSTROM-Befehle anwenden
+// =====================================================
+local function govee_apply()
+{
+  if (!brightness_pending && !rgb_pending) return
+
+  if (!api_lock.enter(0:15)) {
+    log(4, 'Govee %s Apply: Lock-Timeout', model)
+    return
+  }
+
+  // Ein/Aus nur aus expliziter Helligkeit ermitteln.
+  if (brightness_pending && isok(desired_brightness) && desired_brightness <= 0) {
+    if (actual_power != 0) {
+      if (govee_control('devices.capabilities.on_off', 'powerSwitch', 0)) {
+        actual_power = 0
+        brightness_pending = false
+        rgb_pending = false
+      }
+    }
+    else {
+      brightness_pending = false
+      rgb_pending = false
+    }
+  }
+  else if (brightness_pending && isok(desired_brightness) && actual_power != 1) {
+    // WICHTIG: Bei AUS -> EIN ausschliesslich Power senden.
+    // Keine Farb-/Helligkeitsvorgaben aus der Einschalt-Szene uebernehmen.
+    if (govee_control('devices.capabilities.on_off', 'powerSwitch', 1)) {
+      actual_power = 1
+      brightness_pending = false
+      rgb_pending = false
+    }
+  }
+  else if (actual_power == 1) {
+    if (rgb_pending && isok(desired_rgb)) {
+      if (actual_rgb == desired_rgb ||
+          govee_control('devices.capabilities.color_setting', 'colorRgb', desired_rgb)) {
+        actual_rgb = desired_rgb
+        rgb_pending = false
+      }
+    }
+    if (brightness_pending && isok(desired_brightness)) {
+      var target = round(limited(desired_brightness, 1, 100))
+      if (actual_brightness != target) {
+        // Govee-Rate-Limit: 2 Steuerbefehle pro Sekunde je Geraet.
+        delay(0.55)
+      }
+      if (actual_brightness == target ||
+          govee_control('devices.capabilities.range', 'brightness', target)) {
+        actual_brightness = target
+        brightness_pending = false
+      }
+    }
+  }
+  else {
+    // RGB allein schaltet eine ausgeschaltete Lampe nicht ein.
+    rgb_pending = false
+  }
+
+  api_lock.leave()
+}
+
+// =====================================================
+// Apply-Auftraege entprellen (Reihenfolge primaries/apply)
+// =====================================================
+local function schedule_apply()
+{
+  apply_revision = apply_revision + 1
+  var revision = apply_revision
+
+  concurrent passing revision {
+    delay(0.35)
+    if (revision == apply_revision && apply_waiting) {
+      apply_waiting = false
+      log(7, 'Govee %s: konsolidiertes Apply, RGB=%s', model, desired_rgb)
+      govee_apply()
+    }
+  }
+}
+
+// =====================================================
+// Nachrichten von digitalSTROM
+// =====================================================
+on (message()) as m {
+  log(7, 'Govee %s VDC: %s', model, m)
+
+  if (m.message == 'channel') {
+    if (m.id == 'brightness' || m.index == 0 || m.type == 1) {
+      desired_brightness = limited(m.value, 0, 100)
+      brightness_pending = true
+      if (apply_waiting) schedule_apply()
+    }
+  }
+  else if (m.message == 'primaries') {
+    var rgb = calculate_rgb(limited(m.r, 0, 100),
+                            limited(m.g, 0, 100),
+                            limited(m.b, 0, 100))
+    if (isok(rgb)) {
+      desired_rgb = rgb
+      rgb_pending = true
+      if (apply_waiting) schedule_apply()
+    }
+  }
+  else if (m.message == 'apply') {
+    apply_waiting = true
+    schedule_apply()
+  }
+  else if (m.message == 'sync') {
+    var ok = govee_poll()
+    if (!ok) log(4, 'Govee %s Sync: kein aktueller Cloud-Status', model)
+    message({ 'message': 'synced' })
+  }
+}
+
+// Alle 60 Sekunden Govee-Cloud abfragen
+on (every(0:01)) { govee_poll() }
+
+// Initialen Ist-Zustand lesen
+govee_poll()
+return true
+
